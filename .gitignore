@@ -1,24 +1,28 @@
-# Virtual environment
-.venv/
-
-# Data files (too large for GitHub)
-data/
-
-# Python cache
+# Python
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
 .pytest_cache/
-
-# Jupyter checkpoints
 .ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+env/
+venv/
 
 # Environment variables
 .env
+.env.*
+
+# Data
+data/
+data/raw/cache/
 
 # Model artifacts
 *.joblib
+*.pkl
 
 # OS
 .DS_Store
-env/
+Thumbs.db
