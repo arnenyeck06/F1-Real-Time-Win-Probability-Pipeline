@@ -1,0 +1,23 @@
+# Virtual environment
+.venv/
+
+# Data files (too large for GitHub)
+data/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Environment variables
+.env
+
+# Model artifacts
+*.joblib
+
+# OS
+.DS_Store
