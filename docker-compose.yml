@@ -1,5 +1,6 @@
 services:
 
+  # ── Infrastructure ───────────────────────────────────────
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
     container_name: zookeeper
@@ -25,7 +26,9 @@ services:
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
     healthcheck:
@@ -61,6 +64,57 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
+  # ── F1 Pipeline Services ─────────────────────────────────
+  producer:
+    build: ./producer
+    container_name: producer
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER: kafka:29092
+    restart: on-failure
+
+  processor:
+    build: ./processor
+    container_name: processor
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER: kafka:29092
+      REDIS_HOST: redis
+      POSTGRES_HOST: postgres
+    restart: on-failure
+
+  inference:
+    build: ./inference
+    container_name: inference
+    depends_on:
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      REDIS_HOST: redis
+      KAFKA_BROKER: kafka:29092
+    ports:
+      - "8000:8000"
+    restart: on-failure
+
+  dashboard:
+    build: ./dashboard
+    container_name: dashboard
+    ports:
+      - "3000:80"
+    depends_on:
+      - inference
+    restart: on-failure
 
 volumes:
   postgres_data:
