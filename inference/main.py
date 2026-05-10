@@ -1,32 +1,17 @@
+import asyncio
 import json
-import time
-import redis
 import joblib
 import numpy as np
-from kafka import KafkaProducer
+import redis.asyncio as redis
+from contextlib import asynccontextmanager
 from datetime import datetime, UTC
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 
-# ── Config ──────────────────────────────────────────────
 REDIS_HOST = "localhost"
 REDIS_PORT = 6379
-KAFKA_BROKER = "localhost:9092"
-INFERENCE_INTERVAL = 1  # seconds between predictions
+INFERENCE_INTERVAL = 1.0
 
-# ── Load model artifacts ─────────────────────────────────
-print("Loading model artifacts...")
-model = joblib.load("model.joblib")
-feature_cols = joblib.load("feature_cols.joblib")
-print(f"Model loaded — features: {feature_cols}")
-
-# ── Connections ──────────────────────────────────────────
-r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
-
-producer = KafkaProducer(
-    bootstrap_servers=KAFKA_BROKER,
-    value_serializer=lambda v: json.dumps(v, default=str).encode('utf-8')
-)
-
-# ── Driver number to name mapping ────────────────────────
 DRIVER_NAMES = {
     1: 'Verstappen', 11: 'Perez', 44: 'Hamilton',
     63: 'Russell', 16: 'Leclerc', 55: 'Sainz',
@@ -34,106 +19,211 @@ DRIVER_NAMES = {
     18: 'Stroll', 24: 'Zhou', 20: 'Magnussen',
     3: 'Ricciardo', 22: 'Tsunoda', 23: 'Albon',
     27: 'Hulkenberg', 31: 'Ocon', 10: 'Gasly',
-    77: 'Bottas', 2: 'Sargeant'
+    77: 'Bottas', 2: 'Sargeant',
 }
 
-def get_driver_features(driver_number):
-    """Read feature vector from Redis for one driver."""
-    key = f"driver:{driver_number}:features"
-    data = r.hgetall(key)
-    if not data:
-        return None
+# Map model feature names to Redis hash field names.
+FEATURE_TO_REDIS = {
+    'race_completion_pct': 'race_completion_pct',
+    'Position': 'position',
+    'position_delta': 'position_delta',
+    'lap_time_rolling_avg': 'lap_time_rolling_avg',
+    'TyreLife': 'tire_age',
+    'compound_encoded': 'compound_encoded',
+    'pit_stop_count': 'pit_stop_count',
+    'momentum_score': 'momentum_score',
+    'is_leader': 'is_leader',
+}
 
-    # Build feature vector in correct order
-    try:
-        features = [
-            float(data.get('race_completion_pct', 0)),
-            float(data.get('position', 20)),
-            float(data.get('position_delta', 0)),
-            float(data.get('lap_time_rolling_avg', 90)),
-            float(data.get('tire_age', 0)),
-            float(data.get('compound_encoded', 1)),
-            float(data.get('pit_stop_count', 0)),
-            float(data.get('momentum_score', 0)),
-            float(data.get('is_leader', 0))
-        ]
-        return features
-    except Exception as e:
-        print(f"Error parsing features for driver {driver_number}: {e}")
-        return None
+FEATURE_DEFAULTS = {
+    'race_completion_pct': 0.0,
+    'Position': 20.0,
+    'position_delta': 0.0,
+    'lap_time_rolling_avg': 90.0,
+    'TyreLife': 0.0,
+    'compound_encoded': 1.0,
+    'pit_stop_count': 0.0,
+    'momentum_score': 0.0,
+    'is_leader': 0.0,
+}
 
-def run_inference():
-    """Read all driver features, run model, publish predictions."""
-    driver_numbers = list(DRIVER_NAMES.keys())
+print("Loading model artifacts...")
+model = joblib.load("model.joblib")
+scaler = joblib.load("scaler.joblib")
+feature_cols = joblib.load("feature_cols.joblib")
+print(f"Model loaded — features: {feature_cols}")
 
+
+class ConnectionManager:
+    def __init__(self):
+        self.active: set[WebSocket] = set()
+        self.lock = asyncio.Lock()
+
+    async def connect(self, ws: WebSocket):
+        await ws.accept()
+        async with self.lock:
+            self.active.add(ws)
+
+    async def disconnect(self, ws: WebSocket):
+        async with self.lock:
+            self.active.discard(ws)
+
+    async def broadcast(self, payload: dict):
+        async with self.lock:
+            targets = list(self.active)
+        message = json.dumps(payload, default=str)
+        dead = []
+        for ws in targets:
+            try:
+                await ws.send_text(message)
+            except Exception:
+                dead.append(ws)
+        if dead:
+            async with self.lock:
+                for ws in dead:
+                    self.active.discard(ws)
+
+
+manager = ConnectionManager()
+latest_payload: dict | None = None
+
+
+def parse_features(data: dict) -> list[float] | None:
+    row = []
+    for col in feature_cols:
+        redis_key = FEATURE_TO_REDIS.get(col, col)
+        raw = data.get(redis_key)
+        if raw is None:
+            row.append(FEATURE_DEFAULTS.get(col, 0.0))
+            continue
+        try:
+            row.append(float(raw))
+        except (TypeError, ValueError):
+            return None
+    return row
+
+
+async def run_inference(r: redis.Redis) -> dict | None:
     feature_matrix = []
     valid_drivers = []
+    raw_data: dict[int, dict] = {}
 
-    for driver_num in driver_numbers:
-        features = get_driver_features(driver_num)
-        if features:
-            feature_matrix.append(features)
-            valid_drivers.append(driver_num)
+    for driver_num in DRIVER_NAMES:
+        data = await r.hgetall(f"driver:{driver_num}:features")
+        if not data:
+            continue
+        row = parse_features(data)
+        if row is None:
+            continue
+        feature_matrix.append(row)
+        valid_drivers.append(driver_num)
+        raw_data[driver_num] = data
 
     if not feature_matrix:
-        print("No driver features in Redis yet...")
-        return
+        return None
 
-    # Run batch inference
-    X = np.array(feature_matrix)
-    raw_probs = model.predict(X)
+    X = np.array(feature_matrix, dtype=np.float64)
+    X_scaled = scaler.transform(X)
+    raw_probs = np.asarray(model.predict(X_scaled), dtype=np.float64).ravel()
 
-    # Normalize so probabilities sum to 1
-    total = sum(raw_probs)
+    total = float(raw_probs.sum())
     if total > 0:
-        normalized_probs = [p / total for p in raw_probs]
+        normalized = raw_probs / total
     else:
-        normalized_probs = [1/len(raw_probs)] * len(raw_probs)
+        normalized = np.full(len(raw_probs), 1.0 / len(raw_probs))
 
-    # Build predictions payload
     predictions = []
     for i, driver_num in enumerate(valid_drivers):
+        d = raw_data[driver_num]
         predictions.append({
             "driver_number": driver_num,
             "driver_name": DRIVER_NAMES.get(driver_num, str(driver_num)),
-            "win_probability": round(normalized_probs[i], 4),
-            "position": int(float(r.hget(f"driver:{driver_num}:features", "position") or 20)),
-            "race_completion_pct": round(float(r.hget(f"driver:{driver_num}:features", "race_completion_pct") or 0), 3)
+            "win_probability": round(float(normalized[i]), 4),
+            "position": int(float(d.get('position', 20))),
+            "race_completion_pct": round(float(d.get('race_completion_pct', 0)), 3),
         })
 
-    # Sort by win probability
     predictions.sort(key=lambda x: x['win_probability'], reverse=True)
 
-    payload = {
+    return {
         "timestamp": datetime.now(UTC).isoformat(),
-        "predictions": predictions
+        "predictions": predictions,
     }
 
-    # Publish to Kafka
-    producer.send('f1.predictions', value=payload)
-    producer.flush()
 
-    # Print top 5
-    print(f"\n{'='*50}")
-    print(f"Win Probability Update — {payload['timestamp']}")
-    print(f"{'='*50}")
-    for p in predictions[:5]:
-        bar = '█' * int(p['win_probability'] * 50)
-        print(f"P{p['position']:2d} {p['driver_name']:12s} {p['win_probability']*100:5.1f}% {bar}")
-
-def run():
-    print("Inference service started...")
+async def inference_loop(r: redis.Redis):
+    global latest_payload
     while True:
         try:
-            run_inference()
-            time.sleep(INFERENCE_INTERVAL)
-        except KeyboardInterrupt:
-            print("\nStopping inference service...")
-            break
+            payload = await run_inference(r)
+            if payload:
+                latest_payload = payload
+                await manager.broadcast(payload)
+                top = payload['predictions'][:5]
+                ts = payload['timestamp']
+                print(f"\n{'='*50}\nWin Probability Update — {ts}\n{'='*50}")
+                for p in top:
+                    bar = '█' * int(p['win_probability'] * 50)
+                    print(f"P{p['position']:2d} {p['driver_name']:12s} {p['win_probability']*100:5.1f}% {bar}")
+            else:
+                print("No driver features in Redis yet...")
         except Exception as e:
-            print(f"Error: {e}")
-            time.sleep(5)
+            print(f"Inference error: {e}")
+        await asyncio.sleep(INFERENCE_INTERVAL)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+    app.state.redis = r
+    task = asyncio.create_task(inference_loop(r))
+    print("Inference service started...")
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        await r.aclose()
+        print("Inference service stopped.")
+
+
+app = FastAPI(title="F1 Win Probability Inference", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "connections": len(manager.active)}
+
+
+@app.get("/predictions")
+async def predictions():
+    return latest_payload or {"timestamp": None, "predictions": []}
+
+
+@app.websocket("/ws/predictions")
+async def ws_predictions(ws: WebSocket):
+    await manager.connect(ws)
+    try:
+        if latest_payload:
+            await ws.send_text(json.dumps(latest_payload, default=str))
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        await manager.disconnect(ws)
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+        await manager.disconnect(ws)
+
 
 if __name__ == "__main__":
-    run()
-
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
